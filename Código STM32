@@ -1,1 +1,401 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "gpio.h"
+#include "usart.h"
+#include "spi.h"
+#include "fatfs.h"
+#include "lcd.h"
+#include "Bitmaps.h"   // 🔥💧❄️ IMAGENES
+
+#include <string.h>
+#include <stdio.h>
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+
+/* ========= DEFINES PARA BITMAPS (AJUSTA SI TUS IMAGENES SON DE OTRO TAMANO) ========= */
+#define FUEGO_W   160
+#define FUEGO_H   125
+
+#define AGUA_W    160
+#define AGUA_H    135
+
+#define HIELO_W   160
+#define HIELO_H   125
+
+/* ========= VARIABLES GLOBALES ========= */
+
+// Frame que manda el ESP32: "TT.dd C\r\n" (9 bytes)
+uint8_t  sensor_frame[9];
+char     medicion[6];       // "TT.dd" + '\0'  (VALOR YA AJUSTADO)
+char     escritura[64];
+char     mensaje_cmd = '0';
+
+// FATFS / SD
+FATFS   fs;
+FIL     fil;
+FRESULT fres;
+
+/* ========= PROTOTIPOS ESTÁTICOS ========= */
+static void uart2_print(const char *msg);
+static void Draw_MainMenu(void);
+static void SD_Log_Medicion(void);
+static int  parse_temp_centi_5chars(const char *s);
+
+/* ========= FUNCIONES AUXILIARES ========= */
+
+static void uart2_print(const char *msg)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+/* Dibuja el menú principal en la TFT (FULL CAPS) */
+static void Draw_MainMenu(void)
+{
+    LCD_Clear(LCD_COLOR_BLUE);
+    LCD_DrawString(10, 20, "PROYECTO STM32 + TFT", LCD_COLOR_WHITE,  LCD_COLOR_BLUE, 2);
+    LCD_DrawString(10, 60, "BTN1 (PC2) = MEDIR",   LCD_COLOR_YELLOW, LCD_COLOR_BLUE, 2);
+    LCD_DrawString(10, 90, "BTN2 (PC3) = GUARDAR", LCD_COLOR_YELLOW, LCD_COLOR_BLUE, 2);
+}
+
+/* Parser manual: convierte "TT.dd" (5 chars) a enteros en centesimas de grado */
+/* Ej: "25.00" -> 2500, " 5.25" -> 525, "15.50" -> 1550 */
+static int parse_temp_centi_5chars(const char *s)
+{
+    // s[0] y s[1] = parte entera (puede venir espacio o digito)
+    // s[2] = '.'
+    // s[3], s[4] = decimales
+
+    int tens  = 0;
+    int units = 0;
+    int d1    = 0;
+    int d2    = 0;
+
+    char c0 = s[0];
+    char c1 = s[1];
+    char c3 = s[3];
+    char c4 = s[4];
+
+    if (c0 >= '0' && c0 <= '9')
+        tens = c0 - '0';
+    else
+        tens = 0;
+
+    if (c1 >= '0' && c1 <= '9')
+        units = c1 - '0';
+    else
+        units = 0;
+
+    if (c3 >= '0' && c3 <= '9')
+        d1 = c3 - '0';
+    else
+        d1 = 0;
+
+    if (c4 >= '0' && c4 <= '9')
+        d2 = c4 - '0';
+    else
+        d2 = 0;
+
+    int centi = (tens * 10 + units) * 100 + d1 * 10 + d2;
+    return centi;  // en centésimas de °C
+}
+
+/* Monta SD, abre DATOS.TXT y guarda medicion[] con salto de linea */
+static void SD_Log_Medicion(void)
+{
+    if (medicion[0] == '\0')
+    {
+        uart2_print("NO HAY MEDICION PARA GUARDAR EN SD\r\n");
+        return;
+    }
+
+    FRESULT fres_local;
+
+    /* Montar la SD en la unidad por defecto usando nuestro FATFS fs */
+    fres_local = f_mount(&fs, "", 1);
+    if (fres_local != FR_OK)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "ERROR AL MONTAR LA SD, FRESULT = %d\r\n",
+                 fres_local);
+        uart2_print(buf);
+        return;
+    }
+    uart2_print("SD MONTADA CORRECTAMENTE\r\n");
+
+    /* Abrir/crear DATOS.TXT en modo append */
+    fres_local = f_open(&fil, "DATOS.TXT", FA_OPEN_APPEND | FA_WRITE);
+    if (fres_local != FR_OK)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "ERROR AL ABRIR DATOS.TXT, FRESULT = %d\r\n",
+                 fres_local);
+        uart2_print(buf);
+        f_mount(NULL, "", 1);
+        return;
+    }
+
+    /* Escribir medicion + \r\n (YA ES LA TEMPERATURA AJUSTADA) */
+    char line[16];
+    snprintf(line, sizeof(line), "%s\r\n", medicion);
+
+    if (f_puts(line, &fil) < 0)
+    {
+        uart2_print("ERROR AL ESCRIBIR EN DATOS.TXT\r\n");
+    }
+    else
+    {
+        uart2_print("DATO GUARDADO EN DATOS.TXT\r\n");
+    }
+
+    f_close(&fil);
+    f_mount(NULL, "", 1);
+}
+
+/* ========= PROGRAMA PRINCIPAL ========= */
+
+int main(void)
+{
+  /* Reset de periféricos, flash e inicia SysTick */
+  HAL_Init();
+
+  /* Configurar reloj */
+  SystemClock_Config();
+
+  /* Inicializar periféricos generados por CubeMX */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();   // UART2 -> PC (ST-LINK)
+  MX_UART5_Init();         // UART5 -> ESP32
+  MX_SPI1_Init();          // SPI1 -> SD
+  MX_FATFS_Init();         // FatFs (link driver USER)
+
+  /* TFT */
+  LCD_Init();
+  Draw_MainMenu();
+
+  uart2_print("SISTEMA INICIADO. TFT OK\r\n");
+  uart2_print("BTN1 = PC2 (PULL-UP, BOTON A GND)\r\n");
+  uart2_print("BTN2 = PC3 (PULL-UP, BOTON A GND)\r\n");
+  uart2_print("UART5 CONFIGURADO PARA ESP32 (115200 BAUD)\r\n");
+  uart2_print("SPI1 / FATFS CONFIGURADO PARA SD\r\n");
+
+  uint8_t last_btn1 = 1;  // con pull-up, reposo = 1
+  uint8_t last_btn2 = 1;
+
+  memset(medicion, 0, sizeof(medicion));
+
+  while (1)
+  {
+      /* Leer estado de botones */
+      uint8_t now_btn1 = HAL_GPIO_ReadPin(bot_2_GPIO_Port, bot_2_Pin); // PC2 -> BTN1 (MEDIR)
+      uint8_t now_btn2 = HAL_GPIO_ReadPin(bot_1_GPIO_Port, bot_1_Pin); // PC3 -> BTN2 (GUARDAR)
+
+      /* ========== BTN1: MEDIR ========== */
+      if (last_btn1 == 1 && now_btn1 == 0)
+      {
+          uart2_print("BTN1 PRESIONADO (PC2) -> MEDIR\r\n");
+
+          LCD_Clear(LCD_COLOR_BLACK);
+          LCD_DrawString(10, 20, "ESTADO: MIDIENDO", LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+
+          /* Enviar comando '1' al ESP32 */
+          mensaje_cmd = '1';
+          uart2_print("ENVIANDO COMANDO '1' AL ESP32...\r\n");
+          HAL_UART_Transmit(&huart5, (uint8_t*)&mensaje_cmd, 1, HAL_MAX_DELAY);
+
+          /* Recibir 9 bytes: "TT.dd C\r\n" */
+          memset(sensor_frame, 0, sizeof(sensor_frame));
+          if (HAL_UART_Receive(&huart5, sensor_frame, 9, 2000) == HAL_OK)
+          {
+              uart2_print("DATO BRUTO DESDE ESP32 (9 BYTES): ");
+              for (int i = 0; i < 9; i++)
+              {
+                  char tmp[8];
+                  snprintf(tmp, sizeof(tmp), "%02X ", sensor_frame[i]);
+                  uart2_print(tmp);
+              }
+              uart2_print("\r\n");
+
+              /* Buscar inicio del número en el frame recibido */
+              int start = -1;
+              for (int i = 0; i < 9; i++)
+              {
+                  char c = (char)sensor_frame[i];
+                  if ((c >= '0' && c <= '9') || c == ' ')
+                  {
+                      start = i;
+                      break;
+                  }
+              }
+
+              if (start >= 0 && (start + 4) < 9)
+              {
+                  /* Copiar los 5 caracteres numéricos a medicion[] (ORIGINAL) */
+                  for (int i = 0; i < 5; i++)
+                  {
+                      medicion[i] = (char)sensor_frame[start + i];
+                  }
+                  medicion[5] = '\0';
+
+                  uart2_print("MEDICION ASCII ORIGINAL (5 BYTES): '");
+                  uart2_print(medicion);
+                  uart2_print("'\r\n");
+
+                  /* ====== AJUSTE: TEMPERATURA = SENSOR - 10°C ====== */
+                  int temp_centi_raw = parse_temp_centi_5chars(medicion); // ej. "25.00" -> 2500
+                  int temp_centi_adj = temp_centi_raw - 1000;              // -10°C => -1000 centésimas
+
+                  if (temp_centi_adj < 0)
+                      temp_centi_adj = 0;  // clamp para evitar negativas raras
+
+                  /* Log en centésimas (solo para depuración) */
+                  snprintf(escritura, sizeof(escritura),
+                           "TEMP CRUDA CENTI: %d, TEMP AJUSTADA CENTI: %d\r\n",
+                           temp_centi_raw, temp_centi_adj);
+                  uart2_print(escritura);
+
+                  /* Reconstruir la cadena medicion[] con el valor AJUSTADO, formato "TT.dd" */
+                  int entero = temp_centi_adj / 100;   // parte entera
+                  int frac   = temp_centi_adj % 100;   // centésimas
+
+                  if (entero > 99) entero = 99;        // limitamos a 2 dígitos
+
+                  medicion[0] = '0' + (entero / 10);   // decenas
+                  medicion[1] = '0' + (entero % 10);   // unidades
+                  medicion[2] = '.';
+                  medicion[3] = '0' + (frac / 10);     // décimas
+                  medicion[4] = '0' + (frac % 10);     // centésimas
+                  medicion[5] = '\0';
+
+                  /* TFT: mostrar la temperatura ajustada */
+                  char tft_line[16];
+                  snprintf(tft_line, sizeof(tft_line), "%s C", medicion);
+
+                  LCD_Clear(LCD_COLOR_BLACK);
+                  LCD_DrawString(10, 20, "DATO SENSOR:", LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+                  LCD_DrawString(10, 50, tft_line,      LCD_COLOR_YELLOW, LCD_COLOR_BLACK, 3);
+
+                  /* ===== IMAGEN SEGUN RANGO DE TEMPERATURA AJUSTADA =====
+                     < 20°C  -> HIELO   => temp_centi_adj < 2000
+                     20–24.99 -> AGUA   => 2000 <= temp_centi_adj < 2500
+                     >= 25°C -> FUEGO   => temp_centi_adj >= 2500
+                  */
+                  if (temp_centi_adj < 2000)
+                  {
+                      // ❄️ HIELO
+                      LCD_Bitmap(140, 40, HIELO_W, HIELO_H, (uint16_t*)hielo);
+                  }
+                  else if (temp_centi_adj < 2500)
+                  {
+                      // 💧 AGUA
+                      LCD_Bitmap(140, 40, AGUA_W, AGUA_H, (uint16_t*)agua);
+                  }
+                  else
+                  {
+                      // 🔥 FUEGO
+                      LCD_Bitmap(140, 40, FUEGO_W, FUEGO_H, (uint16_t*)fuego);
+                  }
+                  /* ====================================================== */
+              }
+              else
+              {
+                  uart2_print("NO SE ENCONTRO INICIO VALIDO DE NUMERO EN FRAME\r\n");
+                  LCD_Clear(LCD_COLOR_BLACK);
+                  LCD_DrawString(10, 40, "FRAME INVALIDO", LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+              }
+          }
+          else
+          {
+              uart2_print("ERROR/TIMEOUT AL RECIBIR UART5 (9 BYTES)\r\n");
+              LCD_Clear(LCD_COLOR_BLACK);
+              LCD_DrawString(10, 40, "ERROR UART5", LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+          }
+
+          HAL_Delay(1000);
+          Draw_MainMenu();
+      }
+
+      /* ========== BTN2: GUARDAR EN SD ========== */
+      if (last_btn2 == 1 && now_btn2 == 0)
+      {
+          uart2_print("BTN2 PRESIONADO (PC3) -> GUARDAR\r\n");
+
+          /* Mandar comando '2' al ESP32 solo para NeoPixel verde */
+          mensaje_cmd = '2';
+          HAL_UART_Transmit(&huart5, (uint8_t*)&mensaje_cmd, 1, HAL_MAX_DELAY);
+
+          LCD_Clear(LCD_COLOR_BLACK);
+          LCD_DrawString(10, 20, "ESTADO: GUARDANDO", LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+
+          /* Guardamos la temperatura AJUSTADA que está en medicion[] */
+          SD_Log_Medicion();
+
+          HAL_Delay(1000);
+          Draw_MainMenu();
+      }
+
+      last_btn1 = now_btn1;
+      last_btn2 = now_btn2;
+
+      HAL_Delay(20);  // pequeño debounce
+  }
+}
+
+/* ========= CLOCK ========= */
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ========= ERROR HANDLER ========= */
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
 
