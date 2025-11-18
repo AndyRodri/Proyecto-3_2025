@@ -1,0 +1,150 @@
+#include <Arduino.h>
+#include <Temperature_LM75_Derived.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+
+// ===== Sensor LM75 vía I2C =====
+Generic_LM75 temperature;     // Sensor de temperatura (±0.5°C)
+
+// ===== UART y comandos =====
+char comando = '0';           // Comando recibido desde el STM32 por UART2
+
+// ===== NeoPixel =====
+#define Neo_P     27          // Pin del NeoPixel
+#define NUMPIXELS 8           // Número de LEDs en la tira/anillo
+Adafruit_NeoPixel pixels(NUMPIXELS, Neo_P, NEO_GRB + NEO_KHZ800);
+
+// ===== Prototipos =====
+void Transmision_UART(void);
+void iluminarTira(uint8_t r, uint8_t g, uint8_t b);
+void apagarTira();
+
+void setup() {
+  pinMode(Neo_P, OUTPUT);
+
+  // Serial para debug con la PC
+  Serial.begin(115200);
+
+  // Serial2 para comunicación con el STM32
+  Serial2.begin(115200);      // UART hacia STM32 (huart5 en el STM)
+
+  // I2C para el LM75
+  Wire.begin();
+
+  // Inicializar NeoPixel
+  pixels.begin();
+  pixels.clear();
+  pixels.show();
+
+  Serial.println("ESP32 LISTO.");
+}
+
+void loop() {
+  // Imprimir temperatura en el monitor serie (solo para depuración)
+  float tempC = temperature.readTemperatureC();
+  Serial.print("TEMPERATURE = ");
+  Serial.print(tempC, 2);
+  Serial.println(" C");
+
+  // Manejar comandos del STM32 y enviar temperaturas
+  Transmision_UART();
+
+  delay(500);
+}
+
+// =================== NeoPixel helpers ===================
+
+// Enciende TODA la tira con el color (r,g,b)
+void iluminarTira(uint8_t r, uint8_t g, uint8_t b)
+{
+  for (int i = 0; i < NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(r, g, b));
+  }
+  pixels.show();
+}
+
+// Apaga toda la tira
+void apagarTira()
+{
+  for (int i = 0; i < NUMPIXELS; i++) {
+    pixels.setPixelColor(i, 0);
+  }
+  pixels.show();
+}
+
+// ======================================================
+// Función para manejar la comunicación UART con el STM32
+// ======================================================
+void Transmision_UART(void) {
+
+  // 1) Leer si el STM32 nos mandó algo por UART2
+  if (Serial2.available() > 0) {
+    comando = Serial2.read();   // Leer el comando ('1' o '2')
+
+    Serial.print("Byte desde STM32 (DEC): ");
+    Serial.println((uint8_t)comando);
+
+    Serial.print("Byte desde STM32 (ASCII): ");
+    Serial.println(comando);
+
+    Serial.print("COMANDO RECONOCIDO: ");
+    Serial.println(comando);
+
+    // 🔸 AMARILLO: se recibió un comando del STM32
+    iluminarTira(255, 255, 0);   // Amarillo
+    delay(200);
+    apagarTira();
+  }
+
+  // 2) Si STM pidió lectura de temperatura (comando '1')
+  if (comando == '1') {
+    float tempC = temperature.readTemperatureC();
+
+    // ---- Formateo EXACTO para el STM32 ----
+    // Queremos que los PRIMEROS 5 BYTES sean "TT.dd" (ej. "22.50")
+    // y mandaremos un total de 9 bytes.
+    char tempStr[6]; // 5 chars + '\0'
+
+    // %05.2f = total 5 caracteres, 2 decimales. Ej: "23.50" o " 5.25"
+    snprintf(tempStr, sizeof(tempStr), "%05.2f", tempC);
+
+    uint8_t frame[9];
+    // Copiar los 5 caracteres de la temperatura
+    for (int i = 0; i < 5; i++) {
+      frame[i] = (uint8_t)tempStr[i];
+    }
+    // Los otros 4 bytes: " C\r\n"
+    frame[5] = ' ';
+    frame[6] = 'C';
+    frame[7] = '\r';
+    frame[8] = '\n';
+
+    // Enviar exactamente 9 bytes al STM32
+    Serial2.write(frame, 9);
+
+    // Debug por monitor serie
+    Serial.print("Enviado a STM32: '");
+    Serial.print(tempStr);
+    Serial.println("'");
+
+    // 🟣 MORADO: temperatura enviada al STM32
+    iluminarTira(128, 0, 128);   // Morado
+    delay(300);
+    apagarTira();
+
+    // Reset de comando para evitar repetir
+    comando = '0';
+  }
+
+  // 3) Si STM indicó comando '2' (guardar en SD)
+  if (comando == '2') {
+
+    // 🟢 VERDE: acción de guardado (indicador visual)
+    iluminarTira(0, 255, 0);     // Verde
+    delay(300);
+    apagarTira();
+
+    // Reset de comando
+    comando = '0';
+  }
+}
